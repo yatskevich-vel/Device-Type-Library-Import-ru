@@ -1,0 +1,95 @@
+[project]
+name = "device-type-library-import"
+version = "1.7.0"
+description = "Библиотека для импорта типов устройств в NetBox из репозитория DeviceType-Library сообщества"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gitpython>=3.1.51",
+    "pynetbox>=7.8.0",
+    "python-dotenv>=1.2.1",
+    "pyyaml>=6.0.3",
+    "requests>=2.34.2",
+    "rich>=15.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "interrogate>=1.7.0",
+    "pre-commit>=4.6.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=6.0",
+    "pytest-mock>=3.15.1",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.15.21",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "D", "C901"]
+ignore = [
+    # Выбор стиля docstring (выберите соглашение D211+D212)
+    "D203",  # нет пустой строки перед классом (несовместимо с D211)
+    "D213",  # многострочное резюме на второй строке (несовместимо с D212)
+    # Слишком строгие требования к docstring
+    "D100",  # отсутствует docstring в публичном модуле
+    "D104",  # отсутствует docstring в публичном пакете
+    "D105",  # отсутствует docstring в магическом методе
+    # Форматирование секций в стиле Google — слишком педантично
+    "D406",  # имя секции должно заканчиваться новой строкой
+    "D407",  # отсутствует пунктирное подчеркивание после секции
+    "D411",  # отсутствует пустая строка перед секцией
+    "D413",  # отсутствует пустая строка после последней секции
+]
+
+[tool.ruff.lint.mccabe]
+# Отмечать ошибки (`C901`) когда уровень сложности превышает 15.
+max-complexity = 15
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D102", "D103"]  # функциям тестов не нужны docstrings
+
+[tool.interrogate]
+# Измерение покрытия docstrings только для первичного кода. Встроенный
+# Device-Type-Library находится в repo/, а функции тестов освобождены от
+# docstrings (зеркалит ruff D102/D103 per-file-ignore для tests/**).
+fail-under = 95
+exclude = ["repo", "tests", "setup.py", "conftest.py"]
+ignore-init-method = true
+ignore-magic = true
+ignore-nested-functions = true
+ignore-private = false
+
+[tool.pytest.ini_options]
+timeout = 20
+timeout_method = "thread"
+pythonpath = ["."]
+testpaths = [
+  "tests"
+]
+norecursedirs = ["tests/integration"]
+markers = [
+  "integration: сквозные тесты, требующие работающий экземпляр NetBox (установите NETBOX_URL + NETBOX_TOKEN)",
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", "setup.py", "conftest.py"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 96
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+commit_message = "chore(release): v{version}"
+build_command = "uv lock"
+assets = ["uv.lock"]
+
+[tool.semantic_release.changelog]
+template_dir = "templates"
+
+[tool.semantic_release.branches.main]
+match = "(main|master)"

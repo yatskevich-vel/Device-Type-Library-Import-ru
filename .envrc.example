@@ -1,0 +1,34 @@
+# Конфигурация direnv — скопируйте в .envrc и выполните `direnv allow` для включения.
+#
+# Просмотрите этот файл перед включением. Он ТОЛЬКО:
+#   1. Загружает секреты из .env (NETBOX_URL, NETBOX_TOKEN и т.д.) в shell
+#   2. Создает виртуальное окружение uv, если оно не существует
+#   3. Синхронизирует Python зависимости через `uv sync`
+#
+# Предварительные требования: direnv (https://direnv.net) и uv (https://docs.astral.sh/uv/)
+
+# Источник файла .env, если он существует (содержит секреты, не в git)
+if [[ -f .env ]]; then
+    log_status "Загрузка переменных .env..."
+    dotenv .env
+fi
+
+# Создание и активация виртуального окружения uv
+if command -v uv &> /dev/null; then
+    # Создание venv, если он не существует
+    if [[ ! -d .venv ]]; then
+        log_status "Создание виртуального окружения с uv..."
+        uv venv .venv
+    fi
+
+    # Синхронизация зависимостей
+    if [[ -f pyproject.toml ]]; then
+        log_status "Синхронизация зависимостей с uv..."
+        uv sync --quiet --native-tls
+    fi
+
+    # Активация виртуального окружения
+    source .venv/bin/activate
+else
+    log_error "uv не найден. Пожалуйста, установите uv: https://docs.astral.sh/uv/"
+fi

@@ -1,0 +1,2200 @@
+"""Tests for the NetBox GraphQL client module (TDD - tests written first)."""
+
+import pytest
+from unittest.mock import MagicMock
+import requests
+
+from core.graphql_client import DotDict, NetBoxGraphQLClient
+
+
+def _make_paged_responses(data, list_key):
+    """Return a ``[data_response, empty_response]`` pair for paginated query mocks.
+
+    *data* is the dict payload for the first page (e.g. ``{"manufacturer_list": [...]}``)
+    and *list_key* is the key to use for the empty termination page.
+    """
+    data_r = MagicMock()
+    data_r.status_code = 200
+    data_r.raise_for_status = MagicMock()
+    data_r.json.return_value = {"data": data}
+    empty_r = MagicMock()
+    empty_r.status_code = 200
+    empty_r.raise_for_status = MagicMock()
+    empty_r.json.return_value = {"data": {list_key: []}}
+    return [data_r, empty_r]
+
+
+# ── DotDict adapter tests ──────────────────────────────────────────────────
+
+
+class TestDotDict:
+    """Tests for the DotDict adapter that bridges GraphQL dicts to attribute access."""
+
+    def test_attribute_access(self):
+
+        d = DotDict({"name": "Cisco", "slug": "cisco", "id": "1"})
+        assert d.name == "Cisco"
+        assert d.slug == "cisco"
+        assert d.id == "1"
+
+    def test_nested_attribute_access(self):
+
+        d = DotDict({"manufacturer": {"name": "Cisco", "slug": "cisco"}})
+        assert d.manufacturer.name == "Cisco"
+        assert d.manufacturer.slug == "cisco"
+
+    def test_str_returns_name(self):
+        """str() should return the name, matching pynetbox Record behavior."""
+        d = DotDict({"name": "Cisco", "slug": "cisco"})
+        assert str(d) == "Cisco"
+
+    def test_str_without_name_returns_repr(self):
+
+        d = DotDict({"slug": "cisco"})
+        result = str(d)
+        assert isinstance(result, str)
+
+    def test_getattr_with_default(self):
+
+        d = DotDict({"name": "Test"})
+        assert getattr(d, "front_image", None) is None
+        assert getattr(d, "name", "default") == "Test"
+
+    def test_dict_access_still_works(self):
+
+        d = DotDict({"name": "Cisco"})
+        assert d["name"] == "Cisco"
+
+    def test_get_method(self):
+
+        d = DotDict({"name": "Cisco"})
+        assert d.get("name") == "Cisco"
+        assert d.get("missing", "default") == "default"
+
+    def test_in_operator(self):
+
+        d = DotDict({"name": "Cisco", "slug": "cisco"})
+        assert "name" in d
+        assert "missing" not in d
+
+    def test_equality_by_data(self):
+
+        d1 = DotDict({"name": "Cisco"})
+        d2 = DotDict({"name": "Cisco"})
+        assert d1 == d2
+
+    def test_none_attribute_returns_none(self):
+
+        d = DotDict({"front_image": None})
+        assert d.front_image is None
+
+    def test_update_method(self):
+        """DotDict.update() should work for property updates like pynetbox."""
+        d = DotDict({"name": "Old", "slug": "old"})
+        d.update({"name": "New"})
+        assert d.name == "New"
+        assert d["name"] == "New"
+
+
+# ── Core client tests ──────────────────────────────────────────────────────
+
+
+class TestNetBoxGraphQLClient:
+    """Tests for NetBoxGraphQLClient initialization and configuration."""
+
+    def test_init_stores_config(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "mytoken", ignore_ssl=True)
+        assert client.url == "http://netbox.local"
+        assert client.graphql_url == "http://netbox.local/graphql/"
+        assert client.token == "mytoken"
+        assert client.ignore_ssl is True
+
+    def test_init_strips_trailing_slash(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local/", "tok")
+        assert client.graphql_url == "http://netbox.local/graphql/"
+
+    def test_init_defaults_ignore_ssl_false(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "tok")
+        assert client.ignore_ssl is False
+
+    def test_v1_token_uses_token_auth(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "abcdef1234567890abcdef1234567890abcdef12")
+        client._session.headers.update.assert_called_once_with(
+            {
+                "Authorization": "Token abcdef1234567890abcdef1234567890abcdef12",
+                "Content-Type": "application/json",
+            }
+        )
+
+    def test_v2_token_uses_bearer_auth(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "nbt_abc123.secrettoken")
+        client._session.headers.update.assert_called_once_with(
+            {
+                "Authorization": "Bearer nbt_abc123.secrettoken",
+                "Content-Type": "application/json",
+            }
+        )
+
+
+class TestGraphQLQuery:
+    """Tests for the low-level query() method."""
+
+    def _make_client(self, **kwargs):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "testtoken", **kwargs)
+
+    def test_query_posts_to_graphql_endpoint(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"manufacturer_list": []}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        client.query("{ manufacturer_list { id name } }")
+
+        mock_post.assert_called_once()
+        args, kwargs = mock_post.call_args
+        assert args[0] == "http://netbox.local/graphql/"
+        assert kwargs["json"]["query"] == "{ manufacturer_list { id name } }"
+        # Headers and verify are configured on the session at init time
+        client._session.headers.update.assert_called_once_with(
+            {"Authorization": "Token testtoken", "Content-Type": "application/json"}
+        )
+        assert client.ignore_ssl is False
+
+    def test_query_passes_variables(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        client.query("query($id: Int!) { manufacturer(id: $id) { name } }", variables={"id": 1})
+
+        payload = mock_post.call_args[1]["json"]
+        assert payload["variables"] == {"id": 1}
+
+    def test_query_returns_data(self, mock_post):
+        expected = {"manufacturer_list": [{"id": "1", "name": "Cisco", "slug": "cisco"}]}
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": expected}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        result = client.query("{ manufacturer_list { id name slug } }")
+
+        assert result == expected
+
+    def test_query_ignores_ssl_when_configured(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client(ignore_ssl=True)
+        client.query("{ manufacturer_list { id } }")
+
+        # verify is configured on the session at init time
+        assert client.ignore_ssl is True
+        assert client._session.verify is False
+
+    def test_query_verifies_ssl_by_default(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        client.query("{ manufacturer_list { id } }")
+
+        assert client.ignore_ssl is False
+        assert client._session.verify is True
+
+    def test_query_raises_on_http_error(self, mock_post):
+        from core.graphql_client import GraphQLError
+
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.raise_for_status.side_effect = requests.HTTPError("Server Error")
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        with pytest.raises(GraphQLError, match="Server Error"):
+            client.query("{ manufacturer_list { id } }")
+
+    def test_query_raises_on_graphql_errors(self, mock_post):
+        from core.graphql_client import GraphQLError
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "errors": [{"message": "Field 'foo' not found"}],
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        with pytest.raises(GraphQLError, match="Field 'foo' not found"):
+            client.query("{ foo { id } }")
+
+
+class TestGraphQLQueryAll:
+    """Tests for paginated query_all() method."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_query_all_single_page(self, mock_post):
+        """Single page: data response followed by empty page to confirm end of data."""
+        items = [{"id": "1", "name": "Cisco"}]
+        r_data = MagicMock()
+        r_data.status_code = 200
+        r_data.json.return_value = {"data": {"manufacturer_list": items}}
+        r_data.raise_for_status = MagicMock()
+        r_empty = MagicMock()
+        r_empty.status_code = 200
+        r_empty.json.return_value = {"data": {"manufacturer_list": []}}
+        r_empty.raise_for_status = MagicMock()
+        mock_post.side_effect = [r_data, r_empty]
+
+        client = self._make_client()
+        result = client.query_all(
+            "query($pagination: OffsetPaginationInput) { manufacturer_list(pagination: $pagination) { id name } }",
+            list_key="manufacturer_list",
+            page_size=100,
+        )
+
+        assert result == items
+        assert mock_post.call_count == 2
+
+    def test_query_all_multiple_pages(self, mock_post):
+        """Fetches additional pages when results == page_size."""
+        page1 = [{"id": str(i)} for i in range(3)]
+        page2 = [{"id": "3"}]
+
+        responses = []
+        for page_data in [page1, page2]:
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"data": {"device_type_list": page_data}}
+            r.raise_for_status = MagicMock()
+            responses.append(r)
+        mock_post.side_effect = responses
+
+        client = self._make_client()
+        result = client.query_all(
+            "query($pagination: OffsetPaginationInput) { device_type_list(pagination: $pagination) { id } }",
+            list_key="device_type_list",
+            page_size=3,
+        )
+
+        assert len(result) == 4
+        assert mock_post.call_count == 2
+        # Verify pagination variables were passed correctly
+        first_call_vars = mock_post.call_args_list[0][1]["json"]["variables"]
+        assert first_call_vars["pagination"] == {"offset": 0, "limit": 3}
+        second_call_vars = mock_post.call_args_list[1][1]["json"]["variables"]
+        assert second_call_vars["pagination"] == {"offset": 3, "limit": 3}
+
+    def test_query_all_empty_result(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"manufacturer_list": []}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        result = client.query_all(
+            "query($pagination: OffsetPaginationInput) { manufacturer_list(pagination: $pagination) { id } }",
+            list_key="manufacturer_list",
+        )
+
+        assert result == []
+
+    def test_query_all_merges_extra_variables(self, mock_post):
+        """Extra variables are merged alongside pagination."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"device_type_list": []}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        client.query_all(
+            "query($pagination: OffsetPaginationInput, $name: String) { "
+            "device_type_list(pagination: $pagination, filters: {name: $name}) { id } }",
+            list_key="device_type_list",
+            variables={"name": "test"},
+        )
+
+        sent_vars = mock_post.call_args[1]["json"]["variables"]
+        assert sent_vars["name"] == "test"
+        assert "pagination" in sent_vars
+
+    def test_query_all_warns_when_server_clamps_page_size(self, mock_post):
+        """Server clamping detection: warns once when effective page < requested."""
+        # Server caps at 2, we request 10; three pages total with 2+2+1 items.
+        # Page 3 has 1 item (< effective_page_size=2), so query_all stops there
+        # without needing a terminal empty page.
+        pages = [
+            [{"id": "1"}, {"id": "2"}],
+            [{"id": "3"}, {"id": "4"}],
+            [{"id": "5"}],
+        ]
+        responses = []
+        for page_data in pages:
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"data": {"device_type_list": page_data}}
+            r.raise_for_status = MagicMock()
+            responses.append(r)
+        mock_post.side_effect = responses
+
+        warned_msgs = []
+
+        class FakeLog:
+            def log(self, msg):
+                warned_msgs.append(msg)
+
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "tok", log_handler=FakeLog())
+        result = client.query_all(
+            "query($p: OffsetPaginationInput) { device_type_list(pagination: $p) { id } }",
+            list_key="device_type_list",
+            page_size=10,
+        )
+
+        assert len(result) == 5
+        assert mock_post.call_count == 3
+        assert len(warned_msgs) == 1
+        assert "2" in warned_msgs[0]  # effective page size in warning
+        assert "10" in warned_msgs[0]  # requested page size in warning
+
+    def test_query_all_clamping_warning_emitted_only_once(self, mock_post):
+        """Clamping warning is emitted at most once per URL+page-size combination."""
+
+        # Two separate query_all calls, each seeing clamping.
+        def make_pages(n_pages, page_size=2):
+            pages = [[{"id": str(i * page_size + j)} for j in range(page_size)] for i in range(n_pages)]
+            pages.append([])
+            return pages
+
+        all_pages = make_pages(2) + make_pages(2)
+        responses = []
+        for page_data in all_pages:
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"data": {"device_type_list": page_data}}
+            r.raise_for_status = MagicMock()
+            responses.append(r)
+        mock_post.side_effect = responses
+
+        warned_msgs = []
+
+        class FakeLog:
+            def log(self, msg):
+                warned_msgs.append(msg)
+
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "tok", log_handler=FakeLog())
+        client.query_all(
+            "query($p: OffsetPaginationInput) { device_type_list(pagination: $p) { id } }",
+            list_key="device_type_list",
+            page_size=10,
+        )
+        client.query_all(
+            "query($p: OffsetPaginationInput) { device_type_list(pagination: $p) { id } }",
+            list_key="device_type_list",
+            page_size=10,
+        )
+
+        assert mock_post.call_count == 6
+        assert len(warned_msgs) == 1
+
+
+# ── Query method tests ─────────────────────────────────────────────────────
+
+
+class TestGetManufacturers:
+    """Tests for the get_manufacturers() convenience method."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "tok")
+        return client
+
+    def test_returns_dict_keyed_by_name(self, mock_post):
+        data = {
+            "manufacturer_list": [
+                {"id": "1", "name": "Cisco", "slug": "cisco"},
+                {"id": "2", "name": "Juniper", "slug": "juniper"},
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "manufacturer_list")
+
+        client = self._make_client()
+        result = client.get_manufacturers()
+
+        assert "Cisco" in result
+        assert "Juniper" in result
+        # Dict access
+        assert result["Cisco"]["slug"] == "cisco"
+        assert result["Cisco"]["id"] == 1  # GraphQL string IDs are coerced to int
+        # Attribute access (pynetbox Record compatibility)
+        assert result["Cisco"].slug == "cisco"
+        assert result["Cisco"].name == "Cisco"
+        # str() returns name (matching pynetbox behavior)
+        assert str(result["Cisco"]) == "Cisco"
+
+    def test_returns_empty_dict_when_no_manufacturers(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"manufacturer_list": []}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        result = client.get_manufacturers()
+
+        assert result == {}
+
+
+class TestGetDeviceTypes:
+    """Tests for the get_device_types() convenience method."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_returns_two_indexes(self, mock_post):
+        data = {
+            "device_type_list": [
+                {
+                    "id": "1",
+                    "model": "Catalyst 9300",
+                    "slug": "catalyst-9300",
+                    "front_image": None,
+                    "rear_image": None,
+                    "manufacturer": {"id": "10", "name": "Cisco", "slug": "cisco"},
+                },
+                {
+                    "id": "2",
+                    "model": "MX480",
+                    "slug": "mx480",
+                    "front_image": "http://netbox/media/front.jpg",
+                    "rear_image": None,
+                    "manufacturer": {"id": "20", "name": "Juniper", "slug": "juniper"},
+                },
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "device_type_list")
+
+        client = self._make_client()
+        by_model, by_slug = client.get_device_types()
+
+        # by_model index
+        assert ("cisco", "Catalyst 9300") in by_model
+        assert ("juniper", "MX480") in by_model
+        assert by_model[("cisco", "Catalyst 9300")]["id"] == 1
+        # Attribute access (pynetbox Record compatibility)
+        dt = by_model[("cisco", "Catalyst 9300")]
+        assert dt.model == "Catalyst 9300"
+        assert dt.slug == "catalyst-9300"
+        assert dt.manufacturer.slug == "cisco"
+        assert dt.manufacturer.name == "Cisco"
+        assert dt.id == 1
+        # front_image / rear_image
+        assert getattr(dt, "front_image", None) is None
+        dt2 = by_model[("juniper", "MX480")]
+        assert dt2.front_image == "http://netbox/media/front.jpg"
+
+        # by_slug index
+        assert ("cisco", "catalyst-9300") in by_slug
+        assert ("juniper", "mx480") in by_slug
+
+    def test_empty_device_types(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"device_type_list": []}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        by_model, by_slug = client.get_device_types()
+
+        assert by_model == {}
+        assert by_slug == {}
+
+    def test_image_dict_flattened_to_url(self, mock_post):
+        """When GraphQL returns image fields as {url: ...} dicts they should be flattened to strings."""
+        data = {
+            "device_type_list": [
+                {
+                    "id": "5",
+                    "model": "Nexus 9000",
+                    "slug": "nexus-9000",
+                    "front_image": {"url": "http://netbox/media/nexus.front.jpg"},
+                    "rear_image": {"url": "http://netbox/media/nexus.rear.jpg"},
+                    "manufacturer": {"id": "30", "name": "Cisco", "slug": "cisco"},
+                }
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "device_type_list")
+
+        client = self._make_client()
+        by_model, by_slug = client.get_device_types()
+
+        dt = by_model[("cisco", "Nexus 9000")]
+        assert dt.front_image == "http://netbox/media/nexus.front.jpg"
+        assert dt.rear_image == "http://netbox/media/nexus.rear.jpg"
+        assert ("cisco", "nexus-9000") in by_slug
+
+    def test_image_dict_with_none_url_flattened_to_none(self, mock_post):
+        """When the image dict has url=None the record should store None."""
+        data = {
+            "device_type_list": [
+                {
+                    "id": "6",
+                    "model": "ASR 9000",
+                    "slug": "asr-9000",
+                    "front_image": {"url": None},
+                    "rear_image": None,
+                    "manufacturer": {"id": "30", "name": "Cisco", "slug": "cisco"},
+                }
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "device_type_list")
+
+        client = self._make_client()
+        by_model, _ = client.get_device_types()
+
+        dt = by_model[("cisco", "ASR 9000")]
+        assert dt.front_image is None
+        assert dt.rear_image is None
+
+
+class TestGetModuleTypes:
+    """Tests for the get_module_types() convenience method."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_returns_nested_dict_by_manufacturer_and_model(self, mock_post):
+        data = {
+            "module_type_list": [
+                {
+                    "id": "42",
+                    "model": "Linecard 1",
+                    "manufacturer": {"id": "20", "name": "Juniper", "slug": "juniper"},
+                },
+                {
+                    "id": "43",
+                    "model": "Linecard 2",
+                    "manufacturer": {"id": "20", "name": "Juniper", "slug": "juniper"},
+                },
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "module_type_list")
+
+        client = self._make_client()
+        result = client.get_module_types()
+
+        assert "juniper" in result
+        assert "Linecard 1" in result["juniper"]
+        assert result["juniper"]["Linecard 1"]["id"] == 42
+        assert result["juniper"]["Linecard 2"]["id"] == 43
+        # Attribute access (pynetbox Record compatibility)
+        mt = result["juniper"]["Linecard 1"]
+        assert mt.id == 42
+        assert mt.model == "Linecard 1"
+        assert mt.manufacturer.slug == "juniper"
+
+    def test_returns_empty_dict_when_no_modules(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"module_type_list": []}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        result = client.get_module_types()
+
+        assert result == {}
+
+
+class TestGetRackTypes:
+    """Tests for the get_rack_types() convenience method."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_returns_nested_dict_by_manufacturer_and_model(self, mock_post):
+        data = {
+            "rack_type_list": [
+                {
+                    "id": "10",
+                    "model": "AR1300",
+                    "slug": "apc-ar1300",
+                    "form_factor": "4-post-cabinet",
+                    "width": 19,
+                    "u_height": 42,
+                    "starting_unit": 1,
+                    "outer_width": 600,
+                    "outer_height": 1991,
+                    "outer_depth": 1070,
+                    "outer_unit": "mm",
+                    "mounting_depth": 914,
+                    "weight": 125.09,
+                    "max_weight": 1020,
+                    "weight_unit": "kg",
+                    "desc_units": False,
+                    "comments": "",
+                    "description": "APC NetShelter SX, 42U",
+                    "manufacturer": {"id": "5", "name": "APC", "slug": "apc"},
+                },
+                {
+                    "id": "11",
+                    "model": "AR3300",
+                    "slug": "apc-ar3300",
+                    "form_factor": "4-post-cabinet",
+                    "width": 19,
+                    "u_height": 42,
+                    "starting_unit": 1,
+                    "outer_width": 600,
+                    "outer_height": 1991,
+                    "outer_depth": 1070,
+                    "outer_unit": "mm",
+                    "mounting_depth": 914,
+                    "weight": 130.0,
+                    "max_weight": 1020,
+                    "weight_unit": "kg",
+                    "desc_units": False,
+                    "comments": "",
+                    "description": "",
+                    "manufacturer": {"id": "5", "name": "APC", "slug": "apc"},
+                },
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "rack_type_list")
+
+        client = self._make_client()
+        result = client.get_rack_types()
+
+        assert "apc" in result
+        assert "AR1300" in result["apc"]
+        assert "AR3300" in result["apc"]
+        assert result["apc"]["AR1300"]["id"] == 10
+        assert result["apc"]["AR3300"]["id"] == 11
+        # Attribute access (DotDict compatibility)
+        rt = result["apc"]["AR1300"]
+        assert rt.id == 10
+        assert rt.model == "AR1300"
+        assert rt.slug == "apc-ar1300"
+        assert rt.u_height == 42
+        assert rt.manufacturer.slug == "apc"
+
+    def test_returns_empty_dict_when_no_rack_types(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"rack_type_list": []}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        result = client.get_rack_types()
+
+        assert result == {}
+
+    def test_field_values_accessible_as_dotdict_attributes(self, mock_post):
+        data = {
+            "rack_type_list": [
+                {
+                    "id": "99",
+                    "model": "TestRack",
+                    "slug": "vendor-testrack",
+                    "form_factor": "2-post-frame",
+                    "width": 23,
+                    "u_height": 12,
+                    "starting_unit": 1,
+                    "outer_width": 500,
+                    "outer_height": 600,
+                    "outer_depth": 700,
+                    "outer_unit": "mm",
+                    "mounting_depth": 400,
+                    "weight": 50.0,
+                    "max_weight": 500,
+                    "weight_unit": "kg",
+                    "desc_units": True,
+                    "comments": "a comment",
+                    "description": "A test rack",
+                    "manufacturer": {"id": "7", "name": "Vendor", "slug": "vendor"},
+                }
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "rack_type_list")
+
+        client = self._make_client()
+        result = client.get_rack_types()
+
+        rt = result["vendor"]["TestRack"]
+        assert rt.form_factor == "2-post-frame"
+        assert rt.width == 23
+        assert rt.outer_unit == "mm"
+        assert rt.desc_units is True
+        assert rt.comments == "a comment"
+        assert rt.description == "A test rack"
+
+
+class TestGetModuleTypeImages:
+    """Tests for the get_module_type_images() convenience method."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_returns_mapping_of_ids_to_name_sets(self, mock_post):
+        data = {
+            "image_attachment_list": [
+                {"id": "1", "name": "front", "object_id": 42},
+                {"id": "2", "name": "rear", "object_id": 42},
+                {"id": "3", "name": "top", "object_id": 43},
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "image_attachment_list")
+
+        client = self._make_client()
+        result = client.get_module_type_images()
+
+        assert result[42] == {"front", "rear"}
+        assert result[43] == {"top"}
+
+    def test_skips_entries_without_name(self, mock_post):
+        data = {
+            "image_attachment_list": [
+                {"id": "1", "name": "", "object_id": 42},
+                {"id": "2", "name": None, "object_id": 42},
+                {"id": "3", "name": "valid", "object_id": 42},
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "image_attachment_list")
+
+        client = self._make_client()
+        result = client.get_module_type_images()
+
+        assert result[42] == {"valid"}
+
+    def test_returns_empty_dict_when_no_attachments(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"image_attachment_list": []}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        result = client.get_module_type_images()
+
+        assert result == {}
+
+    def test_falls_back_to_python_filter_on_schema_error(self, mock_post):
+        """When the filtered query raises GraphQLError, fall back to fetch-all + Python filter."""
+        error_response = MagicMock()
+        error_response.status_code = 200
+        error_response.raise_for_status = MagicMock()
+        error_response.json.return_value = {"errors": [{"message": "Expected value of type 'ContentTypeFilter'"}]}
+
+        fallback_response = MagicMock()
+        fallback_response.status_code = 200
+        fallback_response.raise_for_status = MagicMock()
+        fallback_response.json.return_value = {
+            "data": {
+                "image_attachment_list": [
+                    {
+                        "id": "1",
+                        "name": "front",
+                        "object_id": 10,
+                        "object_type": {"app_label": "dcim", "model": "moduletype"},
+                    },
+                    {
+                        "id": "2",
+                        "name": "other",
+                        "object_id": 20,
+                        "object_type": {"app_label": "dcim", "model": "devicetype"},
+                    },
+                ]
+            }
+        }
+        empty_response = MagicMock()
+        empty_response.status_code = 200
+        empty_response.raise_for_status = MagicMock()
+        empty_response.json.return_value = {"data": {"image_attachment_list": []}}
+        mock_post.side_effect = [error_response, fallback_response, empty_response]
+
+        client = self._make_client()
+        result = client.get_module_type_images()
+
+        assert result == {10: {"front"}}
+
+
+# ── get_module_type_image_details tests ───────────────────────────────────
+
+
+class TestGetModuleTypeImageDetails:
+    """Tests for the get_module_type_image_details() convenience method."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_returns_mapping_by_module_type_id(self, mocker):
+        """Returns dict with structure {module_type_id: {attachment_name: {"att_id": id, "url": url}}}."""
+        items = [
+            {"id": 1, "name": "front", "object_id": 42, "image": {"url": "http://example.com/front.jpg"}},
+            {"id": 2, "name": "rear", "object_id": 42, "image": {"url": "http://example.com/rear.jpg"}},
+            {"id": 3, "name": "detail", "object_id": 43, "image": {"url": "http://example.com/detail.jpg"}},
+        ]
+        client = self._make_client()
+        mocker.patch.object(client, "query_all", return_value=items)
+
+        result = client.get_module_type_image_details()
+
+        assert result[42]["front"] == {"att_id": 1, "url": "http://example.com/front.jpg"}
+        assert result[42]["rear"] == {"att_id": 2, "url": "http://example.com/rear.jpg"}
+        assert result[43]["detail"] == {"att_id": 3, "url": "http://example.com/detail.jpg"}
+
+    def test_fallback_on_graphql_error(self, mocker):
+        """When filtered query fails, falls back to fetch-all + Python filter by object_type."""
+        from core.graphql_client import GraphQLError
+
+        client = self._make_client()
+        error = GraphQLError("Field 'filters' not found")
+
+        fallback_items = [
+            {
+                "id": 1,
+                "name": "front",
+                "object_id": 42,
+                "image": {"url": "http://example.com/front.jpg"},
+                "object_type": {"app_label": "dcim", "model": "moduletype"},
+            },
+            {
+                "id": 2,
+                "name": "other",
+                "object_id": 50,
+                "image": {"url": "http://example.com/other.jpg"},
+                "object_type": {"app_label": "circuits", "model": "provider"},
+            },
+        ]
+        mocker.patch.object(client, "query_all", side_effect=[error, fallback_items])
+
+        result = client.get_module_type_image_details()
+
+        assert result[42]["front"] == {"att_id": 1, "url": "http://example.com/front.jpg"}
+        assert 50 not in result
+
+    def test_skips_items_without_name(self, mocker):
+        """Items with None or empty name should be skipped."""
+        items = [
+            {"id": 1, "name": None, "object_id": 42, "image": {"url": "http://example.com/1.jpg"}},
+            {"id": 2, "name": "", "object_id": 42, "image": {"url": "http://example.com/2.jpg"}},
+            {"id": 3, "name": "valid", "object_id": 42, "image": {"url": "http://example.com/3.jpg"}},
+        ]
+        client = self._make_client()
+        mocker.patch.object(client, "query_all", return_value=items)
+
+        result = client.get_module_type_image_details()
+
+        assert 42 in result
+        assert "valid" in result[42]
+        assert None not in result[42]
+        assert "" not in result[42]
+
+    def test_string_object_id_coerced_to_int(self, mocker):
+        """String object_id values should be coerced to integers."""
+        items = [
+            {"id": 1, "name": "img", "object_id": "42", "image": {"url": "http://example.com/1.jpg"}},
+        ]
+        client = self._make_client()
+        mocker.patch.object(client, "query_all", return_value=items)
+
+        result = client.get_module_type_image_details()
+
+        assert 42 in result
+        assert result[42]["img"]["att_id"] == 1
+
+    def test_string_att_id_coerced_to_int(self, mocker):
+        """String attachment IDs should be coerced to integers."""
+        items = [{"id": "99", "name": "img", "object_id": 10, "image": {"url": "http://x.com/1.jpg"}}]
+        client = self._make_client()
+        mocker.patch.object(client, "query_all", return_value=items)
+        result = client.get_module_type_image_details()
+        assert result[10]["img"]["att_id"] == 99
+
+    def test_invalid_string_att_id_stored_as_none(self, mocker):
+        """A non-numeric attachment ID string should store att_id=None, not crash."""
+        items = [{"id": "not-valid", "name": "img", "object_id": 10, "image": {"url": "http://x.com/1.jpg"}}]
+        client = self._make_client()
+        mocker.patch.object(client, "query_all", return_value=items)
+        result = client.get_module_type_image_details()
+        assert result[10]["img"]["att_id"] is None
+
+    def test_non_numeric_string_object_id_is_skipped(self, mocker):
+        """Items with a non-numeric string object_id should be skipped silently."""
+        items = [
+            {"id": 1, "name": "front", "object_id": "not-a-number", "image": {"url": "http://x.com/1.jpg"}},
+            {"id": 2, "name": "rear", "object_id": "42", "image": {"url": "http://x.com/2.jpg"}},
+        ]
+        client = self._make_client()
+        mocker.patch.object(client, "query_all", return_value=items)
+        result = client.get_module_type_image_details()
+        assert 42 in result
+        assert all("front" not in v for v in result.values())
+
+
+# ── get_component_templates tests ──────────────────────────────────────────
+
+
+class TestGetComponentTemplates:
+    """Tests for the get_component_templates() convenience method."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_returns_dotdict_records_with_parent_info(self, mock_post):
+        """Records should be DotDicts with device_type/module_type and correct id types."""
+        data = {
+            "interface_template_list": [
+                {
+                    "id": "10",
+                    "name": "eth0",
+                    "type": "1000base-t",
+                    "label": "",
+                    "mgmt_only": False,
+                    "enabled": True,
+                    "poe_mode": None,
+                    "poe_type": None,
+                    "device_type": {"id": "1"},
+                    "module_type": None,
+                },
+                {
+                    "id": "11",
+                    "name": "eth1",
+                    "type": "1000base-t",
+                    "label": "uplink",
+                    "mgmt_only": False,
+                    "enabled": True,
+                    "poe_mode": None,
+                    "poe_type": None,
+                    "device_type": {"id": "1"},
+                    "module_type": None,
+                },
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "interface_template_list")
+
+        client = self._make_client()
+        records = client.get_component_templates("interface_templates")
+
+        assert len(records) == 2
+        assert isinstance(records[0], DotDict)
+        assert records[0].name == "eth0"
+        assert records[0].id == 10
+        assert records[0].device_type.id == 1
+        assert records[1].label == "uplink"
+
+    def test_returns_empty_list_when_no_records(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"data": {"power_port_template_list": []}}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        records = client.get_component_templates("power_port_templates")
+
+        assert records == []
+
+    def test_all_endpoint_names_are_supported(self):
+        """Every component endpoint name used by DeviceTypes should be recognized."""
+        from core.graphql_client import COMPONENT_TEMPLATE_FIELDS
+
+        expected_endpoints = [
+            "interface_templates",
+            "power_port_templates",
+            "console_port_templates",
+            "console_server_port_templates",
+            "power_outlet_templates",
+            "rear_port_templates",
+            "front_port_templates",
+            "device_bay_templates",
+            "module_bay_templates",
+        ]
+        for endpoint in expected_endpoints:
+            assert endpoint in COMPONENT_TEMPLATE_FIELDS, f"{endpoint} not in COMPONENT_TEMPLATE_FIELDS"
+
+    def test_front_port_templates_uses_mappings_field(self):
+        """front_port_templates fields include the nested mappings subfield (not rear_port_position)."""
+        from core.graphql_client import COMPONENT_TEMPLATE_FIELDS
+
+        fields = COMPONENT_TEMPLATE_FIELDS["front_port_templates"]
+        has_mappings = any("mappings" in f and "{" in f for f in fields)
+        has_rear_port_position_direct = "rear_port_position" in fields
+        assert has_mappings, "Expected mappings { ... } in front_port_templates fields"
+        assert not has_rear_port_position_direct, "rear_port_position should not be a direct field in >= 4.5 schema"
+
+    def test_raises_for_unknown_endpoint(self):
+        """An unknown endpoint name should raise ValueError."""
+        client = self._make_client()
+        with pytest.raises(ValueError, match="Unknown component endpoint"):
+            client.get_component_templates("nonexistent_endpoint")
+
+    def test_module_type_parent_preserved(self, mock_post):
+        """Records with module_type parent should have module_type.id as int."""
+        data = {
+            "console_port_template_list": [
+                {
+                    "id": "20",
+                    "name": "console0",
+                    "type": "rj-45",
+                    "label": "",
+                    "device_type": None,
+                    "module_type": {"id": "5"},
+                },
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "console_port_template_list")
+
+        client = self._make_client()
+        records = client.get_component_templates("console_port_templates")
+
+        assert records[0].module_type.id == 5
+        assert records[0].device_type is None
+
+    def test_device_bay_templates_fields(self, mock_post):
+        """device_bay_templates has no 'type' field — should not error."""
+        data = {
+            "device_bay_template_list": [
+                {
+                    "id": "30",
+                    "name": "Bay 1",
+                    "label": "",
+                    "device_type": {"id": "2"},
+                },
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "device_bay_template_list")
+
+        client = self._make_client()
+        records = client.get_component_templates("device_bay_templates")
+
+        assert records[0].name == "Bay 1"
+        assert records[0].id == 30
+
+    def test_module_bay_templates_fields(self, mock_post):
+        """module_bay_templates should return records with the expected fields, including module_type."""
+        data = {
+            "module_bay_template_list": [
+                {
+                    "id": "40",
+                    "name": "Bay 1",
+                    "position": "1",
+                    "label": "",
+                    "device_type": None,
+                    "module_type": {"id": "7"},
+                },
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "module_bay_template_list")
+
+        client = self._make_client()
+        records = client.get_component_templates("module_bay_templates")
+
+        assert records[0].name == "Bay 1"
+        assert records[0].id == 40
+        assert records[0].module_type.id == 7
+        # module_bay_templates DOES have module_type { id } in NetBox's schema, so the query
+        # should include it (unlike device_bay_templates which truly has no module_type field)
+        sent_query = mock_post.call_args_list[0][1]["json"]["query"]
+        assert "module_type" in sent_query
+
+
+class TestDotDictSetattr:
+    """Tests for DotDict.__setattr__ (attribute-assignment path)."""
+
+    def test_setattr_stores_value_in_dict(self):
+        """Assigning via d.key = value should store the value in the underlying dict."""
+        d = DotDict({"name": "Cisco"})
+        d.slug = "cisco"
+        assert d["slug"] == "cisco"
+        assert d.slug == "cisco"
+
+    def test_setattr_overwrites_existing_key(self):
+        """Attribute assignment overwrites an existing key."""
+        d = DotDict({"name": "Old"})
+        d.name = "New"
+        assert d["name"] == "New"
+
+
+class TestToDotDict:
+    """Tests for the _to_dotdict module-level helper."""
+
+    def test_list_input_returns_list_of_dotdicts(self):
+        """A list input is converted element-wise to DotDicts."""
+        from core.graphql_client import _to_dotdict
+
+        result = _to_dotdict([{"id": "1", "name": "Cisco"}, {"id": "2", "name": "Juniper"}])
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0].name == "Cisco"
+        assert result[0].id == 1
+        assert result[1].id == 2
+
+    def test_non_numeric_id_kept_as_string(self):
+        """When the 'id' string cannot be parsed as int, the original string is kept."""
+        from core.graphql_client import _to_dotdict
+
+        result = _to_dotdict({"id": "not-a-number", "name": "test"})
+        assert result["id"] == "not-a-number"
+        assert result.name == "test"
+
+
+class TestClientLifecycle:
+    """Tests for NetBoxGraphQLClient.close(), __enter__, and __exit__."""
+
+    def test_close_calls_session_close(self):
+        """close() should close the underlying HTTP session."""
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "tok")
+        client.close()
+        client._session.close.assert_called_once()
+
+    def test_context_manager_returns_client(self):
+        """The context manager __enter__ should return the client itself."""
+        from core.graphql_client import NetBoxGraphQLClient
+
+        with NetBoxGraphQLClient("http://netbox.local", "tok") as client:
+            assert isinstance(client, NetBoxGraphQLClient)
+
+    def test_context_manager_closes_session_on_exit(self):
+        """The context manager __exit__ should close the HTTP session."""
+        from core.graphql_client import NetBoxGraphQLClient
+
+        with NetBoxGraphQLClient("http://netbox.local", "tok") as client:
+            pass
+        client._session.close.assert_called_once()
+
+
+class TestQueryValueError:
+    """Tests for the ValueError path in query()."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_query_raises_graphql_error_on_invalid_json(self, mock_post):
+        """A ValueError from response.json() is wrapped in GraphQLError."""
+        from core.graphql_client import GraphQLError
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.side_effect = ValueError("bad json")
+        mock_post.return_value = mock_response
+
+        client = self._make_client()
+        with pytest.raises(GraphQLError, match="Invalid JSON"):
+            client.query("{ foo { id } }")
+
+
+class TestQueryAllOnPage:
+    """Tests for the on_page callback in query_all()."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_on_page_callback_is_called_with_page_count(self, mock_post):
+        """on_page is invoked after each non-empty page with the item count."""
+        items = [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+        r_data = MagicMock()
+        r_data.status_code = 200
+        r_data.raise_for_status = MagicMock()
+        r_data.json.return_value = {"data": {"manufacturer_list": items}}
+        r_empty = MagicMock()
+        r_empty.status_code = 200
+        r_empty.raise_for_status = MagicMock()
+        r_empty.json.return_value = {"data": {"manufacturer_list": []}}
+        mock_post.side_effect = [r_data, r_empty]
+
+        callback_counts = []
+        client = self._make_client()
+        client.query_all(
+            "query($pagination: OffsetPaginationInput) { manufacturer_list(pagination: $pagination) { id } }",
+            list_key="manufacturer_list",
+            page_size=100,
+            on_page=callback_counts.append,
+        )
+
+        assert callback_counts == [3]
+
+
+class TestQueryAllClampingPrintFallback:
+    """Tests for the print() fallback in query_all when no log_handler is set."""
+
+    def test_clamping_warning_uses_print_when_no_log_handler(self, mock_post, capsys):
+        """When log_handler is None the clamping warning goes to stdout via print()."""
+        pages = [
+            [{"id": "1"}, {"id": "2"}],
+            [{"id": "3"}, {"id": "4"}],
+            [{"id": "5"}],
+        ]
+        responses = []
+        for page_data in pages:
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"data": {"device_type_list": page_data}}
+            r.raise_for_status = MagicMock()
+            responses.append(r)
+        mock_post.side_effect = responses
+
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "tok")  # no log_handler
+        result = client.query_all(
+            "query($p: OffsetPaginationInput) { device_type_list(pagination: $p) { id } }",
+            list_key="device_type_list",
+            page_size=10,
+        )
+
+        assert len(result) == 5
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.out
+        assert "2" in captured.out
+        assert "10" in captured.out
+
+
+class TestGetModuleTypeImagesObjectIdConversion:
+    """Tests for the object_id string-to-int conversion in get_module_type_images()."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_string_object_id_is_converted_to_int(self, mock_post):
+        """A numeric string object_id is coerced to int in the result dict."""
+        data = {
+            "image_attachment_list": [
+                {"id": "1", "name": "front", "object_id": "42"},
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "image_attachment_list")
+
+        client = self._make_client()
+        result = client.get_module_type_images()
+
+        assert 42 in result
+        assert result[42] == {"front"}
+
+    def test_non_numeric_string_object_id_is_skipped(self, mock_post):
+        """An object_id string that cannot be parsed as int is skipped (ValueError path)."""
+        data = {
+            "image_attachment_list": [
+                {"id": "1", "name": "front", "object_id": "not-a-number"},
+                {"id": "2", "name": "valid", "object_id": "99"},
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "image_attachment_list")
+
+        client = self._make_client()
+        result = client.get_module_type_images()
+
+        assert 99 in result
+        assert len(result) == 1
+
+
+class TestGetComponentTemplatesFrontPortFallback:
+    """Tests for the front_port_templates mappings/rear_port_position fallback in get_component_templates().
+
+    Primary query uses ``mappings { ... }`` (NetBox >= 4.5).  When that fails the
+    fallback uses ``rear_port_position`` (NetBox < 4.5).  When the old-style
+    ``rear_port_position`` primary fails the fallback drops the field entirely.
+    """
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def _make_response(self, data):
+        r = MagicMock()
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json.return_value = {"data": data}
+        return r
+
+    def _make_error_response(self, message):
+        r = MagicMock()
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json.return_value = {"errors": [{"message": message}]}
+        return r
+
+    def test_primary_mappings_query_succeeds(self, mock_post):
+        """Primary mappings query works (NetBox >= 4.5) — no fallback needed."""
+        rp = {"id": "7", "name": "RP1"}
+        mapping = {
+            "id": "9",
+            "front_port_position": 1,
+            "rear_port_position": 1,
+            "rear_port": rp,
+        }
+        front_ports = [
+            {
+                "id": "50",
+                "name": "FP1",
+                "type": "8p8c",
+                "label": "",
+                "mappings": [mapping],
+                "device_type": {"id": "1"},
+                "module_type": None,
+            }
+        ]
+        mock_post.side_effect = [
+            self._make_response({"front_port_template_list": front_ports}),
+            self._make_response({"front_port_template_list": []}),
+        ]
+
+        client = self._make_client()
+        records = client.get_component_templates("front_port_templates")
+
+        assert len(records) == 1
+        assert records[0].name == "FP1"
+        assert records[0].id == 50
+        assert len(records[0].mappings) == 1
+        assert records[0].mappings[0].rear_port.name == "RP1"
+
+    def test_fallback_to_rear_port_position_on_mappings_error(self, mock_post):
+        """When mappings query fails (< 4.5 schema), retries with rear_port_position."""
+        front_ports = [
+            {
+                "id": "50",
+                "name": "FP1",
+                "type": "8p8c",
+                "label": "",
+                "rear_port_position": 2,
+                "device_type": {"id": "1"},
+                "module_type": None,
+            }
+        ]
+        mock_post.side_effect = [
+            self._make_error_response("Cannot query field 'mappings'"),
+            self._make_response({"front_port_template_list": front_ports}),
+            self._make_response({"front_port_template_list": []}),
+        ]
+
+        client = self._make_client()
+        records = client.get_component_templates("front_port_templates")
+
+        assert len(records) == 1
+        assert records[0].name == "FP1"
+        assert records[0].rear_port_position == 2
+
+    def test_fallback_without_rear_port_position_on_graphql_error(self, mock_post):
+        """When the primary query fails for any front_port reason, retries successfully."""
+        front_ports = [
+            {
+                "id": "50",
+                "name": "FP1",
+                "type": "8p8c",
+                "label": "",
+                "device_type": {"id": "1"},
+                "module_type": None,
+            }
+        ]
+        mock_post.side_effect = [
+            self._make_error_response("Cannot query field 'rear_port_position'"),
+            self._make_response({"front_port_template_list": front_ports}),
+            self._make_response({"front_port_template_list": []}),
+        ]
+
+        client = self._make_client()
+        records = client.get_component_templates("front_port_templates")
+
+        assert len(records) == 1
+        assert records[0].name == "FP1"
+        assert records[0].id == 50
+        # rear_port_position is not in the mock response data, so not present in record
+        assert "rear_port_position" not in records[0]
+
+    def test_fallback_raises_when_all_retries_fail(self, mock_post):
+        """When primary, first fallback, and second fallback all fail, raises the last error."""
+        from core.graphql_client import GraphQLError
+
+        mock_post.side_effect = [
+            self._make_error_response("Cannot query field 'mappings'"),
+            self._make_error_response("Cannot query field 'rear_port_position'"),
+            self._make_error_response("Some other schema error"),
+        ]
+
+        client = self._make_client()
+        with pytest.raises(GraphQLError, match="Some other schema error"):
+            client.get_component_templates("front_port_templates")
+
+    def test_second_fallback_without_any_position_field(self, mock_post):
+        """When first fallback (rear_port_position) also fails, retries without position fields."""
+        front_ports = [
+            {
+                "id": "50",
+                "name": "FP1",
+                "type": "8p8c",
+                "label": "",
+                "device_type": {"id": "1"},
+                "module_type": None,
+            }
+        ]
+        mock_post.side_effect = [
+            self._make_error_response("Cannot query field 'mappings'"),
+            self._make_error_response("Cannot query field 'rear_port_position'"),
+            self._make_response({"front_port_template_list": front_ports}),
+            self._make_response({"front_port_template_list": []}),
+        ]
+
+        client = self._make_client()
+        records = client.get_component_templates("front_port_templates")
+
+        assert len(records) == 1
+        assert records[0].name == "FP1"
+        assert records[0].id == 50
+
+    def test_non_front_port_graphql_error_is_reraised(self, mock_post):
+        """GraphQLError from a non-front_port endpoint propagates unchanged."""
+        from core.graphql_client import GraphQLError
+
+        mock_post.return_value = self._make_error_response("interface field error")
+
+        client = self._make_client()
+        with pytest.raises(GraphQLError, match="interface field error"):
+            client.get_component_templates("interface_templates")
+
+    def test_primary_fails_no_mappings_field_reraises(self, mock_post):
+        """When primary query fails and schema has no 'mappings' field, re-raise immediately.
+
+        Covers graphql_client.py line 541: 'if not has_mappings: raise'.
+        The guard fires when endpoint_name is front_port_templates but the fields list
+        (COMPONENT_TEMPLATE_FIELDS) has been stripped of the 'mappings' entry — meaning
+        there is no fallback query to attempt.
+        """
+        from core.graphql_client import GraphQLError, COMPONENT_TEMPLATE_FIELDS
+        from unittest.mock import patch
+        import core.graphql_client as gc_module
+
+        # Strip 'mappings' from front_port_templates fields so has_mappings is False
+        stripped = {
+            "front_port_templates": [
+                f for f in COMPONENT_TEMPLATE_FIELDS["front_port_templates"] if "mappings" not in f
+            ]
+        }
+
+        mock_post.return_value = self._make_error_response("some field error")
+
+        with patch.dict(gc_module.COMPONENT_TEMPLATE_FIELDS, stripped):
+            client = self._make_client()
+            with pytest.raises(GraphQLError):
+                client.get_component_templates("front_port_templates")
+            # Guard must fire immediately — no fallback POST should be attempted.
+            assert mock_post.call_count == 1
+
+
+class TestCustomPageSize:
+    """Verify that the page_size constructor parameter is respected."""
+
+    def test_default_page_size(self, graphql_client):
+        assert graphql_client.DEFAULT_PAGE_SIZE == 5000
+
+    def test_custom_page_size(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "tok", page_size=500)
+        assert client.DEFAULT_PAGE_SIZE == 500
+
+    def test_custom_page_size_used_in_query_all(self, mock_post):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        client = NetBoxGraphQLClient("http://netbox.local", "tok", page_size=100)
+        mock_post.return_value.json.return_value = {"data": {"items": []}}
+        client.query_all("query($pagination: OffsetPaginationInput) { items }", "items")
+        sent_vars = mock_post.call_args[1]["json"]["variables"]
+        assert sent_vars["pagination"]["limit"] == 100
+
+
+# ---------------------------------------------------------------------------
+# query() error branches: 403, retryable HTTP, RequestException (lines 228, 234-236, 240-245)
+# ---------------------------------------------------------------------------
+
+
+class TestGraphQLQueryErrorPaths:
+    """Tests for error-handling branches in query()."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "testtoken")
+
+    def test_403_raises_graphql_error_with_hint(self, mock_post):
+        """A 403 HTTPError immediately raises GraphQLError with a permission hint."""
+        from core.graphql_client import GraphQLError
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        http_err = requests.exceptions.HTTPError("403 Client Error")
+        http_err.response = mock_resp
+        response_mock = MagicMock()
+        response_mock.raise_for_status.side_effect = http_err
+        mock_post.return_value = response_mock
+
+        client = self._make_client()
+        with pytest.raises(GraphQLError, match="403 Forbidden"):
+            client.query("{ test }")
+
+    def test_429_no_retry_raises_graphql_error(self, mock_post):
+        """A 429 with _retries=0 raises GraphQLError immediately (not retried)."""
+        from core.graphql_client import GraphQLError
+
+        mock_429_resp = MagicMock()
+        http_err_429 = requests.exceptions.HTTPError("429 Too Many Requests")
+        http_err_429.response = MagicMock()
+        http_err_429.response.status_code = 429
+        mock_429_resp.raise_for_status.side_effect = http_err_429
+
+        mock_post.return_value = mock_429_resp
+
+        client = self._make_client()
+        with pytest.raises(GraphQLError):
+            client.query("{ test }", _retries=0)
+
+    def test_429_with_retry_allowed_retries_then_succeeds(self, mock_post):
+        """A 429 with retry budget > 0 sleeps and retries; second call succeeds."""
+        from unittest.mock import patch
+
+        mock_429_resp = MagicMock()
+        http_err_429 = requests.exceptions.HTTPError("429")
+        http_err_429.response = MagicMock()
+        http_err_429.response.status_code = 429
+        mock_429_resp.raise_for_status.side_effect = http_err_429
+
+        mock_200_resp = MagicMock()
+        mock_200_resp.raise_for_status = MagicMock()
+        mock_200_resp.json.return_value = {"data": {"answer": 42}}
+
+        mock_post.side_effect = [mock_429_resp, mock_200_resp]
+
+        client = self._make_client()
+        with patch("core.graphql_client.time.sleep"):
+            result = client.query("{ test }", _retries=1)
+
+        assert result == {"answer": 42}
+
+    def test_request_exception_retries_then_raises_graphql_error(self, mock_post):
+        """Persistent RequestException exhausts retry budget and raises GraphQLError."""
+        from unittest.mock import patch
+
+        from core.graphql_client import GraphQLError
+
+        mock_post.side_effect = requests.exceptions.ConnectionError("connection refused")
+
+        client = self._make_client()
+        with patch("core.graphql_client.time.sleep"):
+            with pytest.raises(GraphQLError, match="connection refused"):
+                client.query("{ test }", _retries=1)
+
+    def test_request_exception_retries_before_exhausting(self, mock_post):
+        """A RequestException on the first attempt stores last_exc and retries."""
+        from unittest.mock import patch
+
+        from core.graphql_client import GraphQLError
+
+        # Fail twice (matching _retries=1 giving 2 total attempts)
+        mock_post.side_effect = requests.exceptions.Timeout("timed out")
+
+        client = self._make_client()
+        with patch("core.graphql_client.time.sleep"):
+            with pytest.raises(GraphQLError, match="timed out"):
+                client.query("{ test }", _retries=1)
+
+
+# ── Vendor-scoped filtering tests ─────────────────────────────────────────
+
+
+class TestVendorScopedDeviceTypes:
+    """Tests for vendor-scoped filtering in get_device_types()."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_single_vendor_filter(self, mock_post):
+        """Test filtering by a single manufacturer slug."""
+        data = {
+            "device_type_list": [
+                {
+                    "id": "1",
+                    "model": "Catalyst 3850",
+                    "slug": "catalyst-3850",
+                    "u_height": 1.0,
+                    "part_number": "WS-C3850-24P",
+                    "is_full_depth": True,
+                    "subdevice_role": None,
+                    "airflow": "front-to-rear",
+                    "weight": 5.4,
+                    "weight_unit": "kg",
+                    "description": "Test device",
+                    "comments": "",
+                    "front_image": None,
+                    "rear_image": None,
+                    "manufacturer": {"id": "10", "name": "Cisco", "slug": "cisco"},
+                }
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "device_type_list")
+
+        client = self._make_client()
+        by_model, by_slug = client.get_device_types(manufacturer_slugs=["cisco"])
+
+        assert ("cisco", "Catalyst 3850") in by_model
+        assert by_model[("cisco", "Catalyst 3850")].model == "Catalyst 3850"
+        # Verify the filter was applied via GraphQL variable (not string interpolation)
+        call_payload = mock_post.call_args_list[0][1]["json"]
+        query = call_payload["query"]
+        variables = call_payload["variables"]
+        assert "filters: {manufacturer: {slug: {exact: $manufacturer_slug}}}" in query
+        assert "$manufacturer_slug: String!" in query
+        assert variables["manufacturer_slug"] == "cisco"
+
+    def test_multiple_vendor_filter(self, mock_post):
+        """Test filtering by multiple manufacturer slugs."""
+        data = {
+            "device_type_list": [
+                {
+                    "id": "1",
+                    "model": "Catalyst 3850",
+                    "slug": "catalyst-3850",
+                    "u_height": 1.0,
+                    "part_number": "",
+                    "is_full_depth": True,
+                    "subdevice_role": None,
+                    "airflow": None,
+                    "weight": None,
+                    "weight_unit": None,
+                    "description": "",
+                    "comments": "",
+                    "front_image": None,
+                    "rear_image": None,
+                    "manufacturer": {"id": "10", "name": "Cisco", "slug": "cisco"},
+                },
+                {
+                    "id": "2",
+                    "model": "EX4300",
+                    "slug": "ex4300",
+                    "u_height": 1.0,
+                    "part_number": "",
+                    "is_full_depth": False,
+                    "subdevice_role": None,
+                    "airflow": None,
+                    "weight": None,
+                    "weight_unit": None,
+                    "description": "",
+                    "comments": "",
+                    "front_image": None,
+                    "rear_image": None,
+                    "manufacturer": {"id": "20", "name": "Juniper", "slug": "juniper"},
+                },
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "device_type_list")
+
+        client = self._make_client()
+        by_model, by_slug = client.get_device_types(manufacturer_slugs=["cisco", "juniper"])
+
+        assert ("cisco", "Catalyst 3850") in by_model
+        assert ("juniper", "EX4300") in by_model
+        # Verify the filter was applied via GraphQL variable (not string interpolation)
+        call_payload = mock_post.call_args_list[0][1]["json"]
+        query = call_payload["query"]
+        variables = call_payload["variables"]
+        assert "filters: {manufacturer: {slug: {in_list: $manufacturer_slugs}}}" in query
+        assert "$manufacturer_slugs: [String!]!" in query
+        assert variables["manufacturer_slugs"] == ["cisco", "juniper"]
+
+    def test_none_manufacturer_slugs_unfiltered(self, mock_post):
+        """Test that manufacturer_slugs=None produces unfiltered behavior."""
+        data = {
+            "device_type_list": [
+                {
+                    "id": "1",
+                    "model": "Test",
+                    "slug": "test",
+                    "u_height": 1.0,
+                    "part_number": "",
+                    "is_full_depth": True,
+                    "subdevice_role": None,
+                    "airflow": None,
+                    "weight": None,
+                    "weight_unit": None,
+                    "description": "",
+                    "comments": "",
+                    "front_image": None,
+                    "rear_image": None,
+                    "manufacturer": {"id": "1", "name": "Test", "slug": "test"},
+                }
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "device_type_list")
+
+        client = self._make_client()
+        by_model, by_slug = client.get_device_types(manufacturer_slugs=None)
+
+        # Verify no filter in the query and no manufacturer variable sent
+        call_payload = mock_post.call_args_list[0][1]["json"]
+        query = call_payload["query"]
+        variables = call_payload["variables"]
+        assert "filters:" not in query
+        assert "manufacturer_slug" not in variables
+
+    def test_empty_list_raises_value_error(self):
+        """Passing [] for manufacturer_slugs should raise ValueError immediately."""
+        client = self._make_client()
+        with pytest.raises(ValueError, match="manufacturer_slugs must be None or a non-empty list"):
+            client.get_device_types(manufacturer_slugs=[])
+
+
+class TestVendorScopedModuleTypes:
+    """Tests for vendor-scoped filtering in get_module_types()."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_single_vendor_filter(self, mock_post):
+        """Test filtering by a single manufacturer slug."""
+        data = {
+            "module_type_list": [
+                {
+                    "id": "1",
+                    "model": "C9300-NM-8X",
+                    "part_number": "C9300-NM-8X",
+                    "airflow": None,
+                    "description": "",
+                    "comments": "",
+                    "weight": None,
+                    "weight_unit": None,
+                    "manufacturer": {"id": "10", "name": "Cisco", "slug": "cisco"},
+                }
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "module_type_list")
+
+        client = self._make_client()
+        result = client.get_module_types(manufacturer_slugs=["cisco"])
+
+        assert "cisco" in result
+        assert "C9300-NM-8X" in result["cisco"]
+        # Verify the filter was applied via GraphQL variable (not string interpolation)
+        call_payload = mock_post.call_args_list[0][1]["json"]
+        query = call_payload["query"]
+        variables = call_payload["variables"]
+        assert "filters: {manufacturer: {slug: {exact: $manufacturer_slug}}}" in query
+        assert "$manufacturer_slug: String!" in query
+        assert variables["manufacturer_slug"] == "cisco"
+
+    def test_multiple_vendor_filter(self, mock_post):
+        """Test filtering by multiple manufacturer slugs."""
+        data = {
+            "module_type_list": [
+                {
+                    "id": "1",
+                    "model": "C9300-NM-8X",
+                    "part_number": "",
+                    "airflow": None,
+                    "description": "",
+                    "comments": "",
+                    "weight": None,
+                    "weight_unit": None,
+                    "manufacturer": {"id": "10", "name": "Cisco", "slug": "cisco"},
+                },
+                {
+                    "id": "2",
+                    "model": "MIC-3D-20GE-SFP",
+                    "part_number": "",
+                    "airflow": None,
+                    "description": "",
+                    "comments": "",
+                    "weight": None,
+                    "weight_unit": None,
+                    "manufacturer": {"id": "20", "name": "Juniper", "slug": "juniper"},
+                },
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "module_type_list")
+
+        client = self._make_client()
+        result = client.get_module_types(manufacturer_slugs=["cisco", "juniper"])
+
+        assert "cisco" in result
+        assert "juniper" in result
+        # Verify the filter was applied via GraphQL variable (not string interpolation)
+        call_payload = mock_post.call_args_list[0][1]["json"]
+        query = call_payload["query"]
+        variables = call_payload["variables"]
+        assert "filters: {manufacturer: {slug: {in_list: $manufacturer_slugs}}}" in query
+        assert "$manufacturer_slugs: [String!]!" in query
+        assert variables["manufacturer_slugs"] == ["cisco", "juniper"]
+
+    def test_empty_list_raises_value_error(self):
+        """Passing [] for manufacturer_slugs should raise ValueError immediately."""
+        client = self._make_client()
+        with pytest.raises(ValueError, match="manufacturer_slugs must be None or a non-empty list"):
+            client.get_module_types(manufacturer_slugs=[])
+
+
+class TestVendorScopedRackTypes:
+    """Tests for vendor-scoped filtering in get_rack_types()."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_single_vendor_filter(self, mock_post):
+        """Test filtering by a single manufacturer slug."""
+        data = {
+            "rack_type_list": [
+                {
+                    "id": "10",
+                    "model": "AR1300",
+                    "slug": "apc-ar1300",
+                    "form_factor": "4-post-cabinet",
+                    "width": 19,
+                    "u_height": 42,
+                    "starting_unit": 1,
+                    "outer_width": None,
+                    "outer_height": None,
+                    "outer_depth": None,
+                    "outer_unit": None,
+                    "mounting_depth": None,
+                    "weight": None,
+                    "max_weight": None,
+                    "weight_unit": None,
+                    "desc_units": False,
+                    "comments": "",
+                    "description": "",
+                    "manufacturer": {"id": "5", "name": "APC", "slug": "apc"},
+                }
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "rack_type_list")
+
+        client = self._make_client()
+        result = client.get_rack_types(manufacturer_slugs=["apc"])
+
+        assert "apc" in result
+        assert "AR1300" in result["apc"]
+        # Verify the filter was applied via GraphQL variable (not string interpolation)
+        call_payload = mock_post.call_args_list[0][1]["json"]
+        query = call_payload["query"]
+        variables = call_payload["variables"]
+        assert "filters: {manufacturer: {slug: {exact: $manufacturer_slug}}}" in query
+        assert "$manufacturer_slug: String!" in query
+        assert variables["manufacturer_slug"] == "apc"
+
+    def test_empty_list_raises_value_error(self):
+        """Passing [] for manufacturer_slugs should raise ValueError immediately."""
+        client = self._make_client()
+        with pytest.raises(ValueError, match="manufacturer_slugs must be None or a non-empty list"):
+            client.get_rack_types(manufacturer_slugs=[])
+
+
+class TestVendorScopedComponentTemplates:
+    """Tests for vendor-scoped filtering in get_component_templates()."""
+
+    def _make_client(self):
+        from core.graphql_client import NetBoxGraphQLClient
+
+        return NetBoxGraphQLClient("http://netbox.local", "tok")
+
+    def test_unfiltered_query(self, mock_post):
+        """Test that manufacturer_slug=None produces unfiltered behavior."""
+        data = {
+            "interface_template_list": [
+                {
+                    "id": "1",
+                    "name": "Ethernet1/0/1",
+                    "type": "1000base-t",
+                    "device_type": {"id": "10"},
+                    "module_type": None,
+                }
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(data, "interface_template_list")
+
+        client = self._make_client()
+        result = client.get_component_templates("interface_templates", manufacturer_slug=None)
+
+        assert len(result) == 1
+        assert result[0].name == "Ethernet1/0/1"
+        # Verify no filter in the query
+        call_args = mock_post.call_args_list[0]
+        query = call_args[1]["json"]["query"]
+        assert "filters:" not in query
+
+    def test_vendor_scoped_two_queries(self, mock_post):
+        """Test that vendor-scoped query makes two separate queries (device + module)."""
+        device_data = {
+            "interface_template_list": [
+                {
+                    "id": "1",
+                    "name": "Ethernet1/0/1",
+                    "type": "1000base-t",
+                    "device_type": {"id": "10"},
+                    "module_type": None,
+                }
+            ]
+        }
+        module_data = {
+            "interface_template_list": [
+                {
+                    "id": "2",
+                    "name": "GigabitEthernet0/0",
+                    "type": "1000base-t",
+                    "device_type": None,
+                    "module_type": {"id": "20"},
+                }
+            ]
+        }
+        # Each query needs a data page followed by an empty page
+        device_responses = _make_paged_responses(device_data, "interface_template_list")
+        module_responses = _make_paged_responses(module_data, "interface_template_list")
+        mock_post.side_effect = device_responses + module_responses
+
+        client = self._make_client()
+        result = client.get_component_templates("interface_templates", manufacturer_slug="cisco")
+
+        assert len(result) == 2
+        assert result[0].name == "Ethernet1/0/1"
+        assert result[1].name == "GigabitEthernet0/0"
+
+        # Verify both filters were applied via GraphQL variables (not string interpolation)
+        calls = mock_post.call_args_list
+        # calls[0]: device_type filter query – data page
+        device_payload = calls[0][1]["json"]
+        device_query = device_payload["query"]
+        device_vars = device_payload["variables"]
+        # calls[1]: device_type filter query – empty terminator (pagination ends)
+        # calls[2]: module_type filter query – data page
+        module_payload = calls[2][1]["json"]
+        module_query = module_payload["query"]
+        module_vars = module_payload["variables"]
+
+        assert "filters: {device_type: {manufacturer: {slug: {exact: $manufacturer_slug}}}}" in device_query
+        assert device_vars["manufacturer_slug"] == "cisco"
+        assert "filters: {module_type: {manufacturer: {slug: {exact: $manufacturer_slug}}}}" in module_query
+        assert module_vars["manufacturer_slug"] == "cisco"
+
+    def test_vendor_scoped_device_bay_single_query(self, mock_post):
+        """Test that device_bay_templates makes only one query (no module_type field)."""
+        device_data = {
+            "device_bay_template_list": [
+                {
+                    "id": "1",
+                    "name": "Device Bay 1",
+                    "label": "Bay 1",
+                    "description": "",
+                    "device_type": {"id": "10"},
+                }
+            ]
+        }
+        mock_post.side_effect = _make_paged_responses(device_data, "device_bay_template_list")
+
+        client = self._make_client()
+        result = client.get_component_templates("device_bay_templates", manufacturer_slug="cisco")
+
+        assert len(result) == 1
+        assert result[0].name == "Device Bay 1"
+
+        # Verify only device_type filter was applied (no module_type query)
+        assert mock_post.call_count == 2  # Just data + empty page
+        device_payload = mock_post.call_args_list[0][1]["json"]
+        device_query = device_payload["query"]
+        device_vars = device_payload["variables"]
+        assert "filters: {device_type: {manufacturer: {slug: {exact: $manufacturer_slug}}}}" in device_query
+        assert device_vars["manufacturer_slug"] == "cisco"
+
+    def test_empty_string_raises_value_error(self):
+        """Passing empty string for manufacturer_slug should raise ValueError immediately."""
+        client = self._make_client()
+        with pytest.raises(ValueError, match="manufacturer_slug must be None or a non-empty string"):
+            client.get_component_templates("interface_templates", manufacturer_slug="")
+
+    def test_vendor_scoped_with_on_page_callback(self, mock_post):
+        """Test that on_page callback is called for both queries."""
+        device_data = {
+            "interface_template_list": [
+                {"id": "1", "name": "eth0", "type": "1000base-t", "device_type": {"id": "10"}, "module_type": None},
+            ]
+        }
+        module_data = {
+            "interface_template_list": [
+                {"id": "2", "name": "eth1", "type": "1000base-t", "device_type": None, "module_type": {"id": "20"}},
+            ]
+        }
+
+        mock_post.side_effect = _make_paged_responses(device_data, "interface_template_list") + _make_paged_responses(
+            module_data, "interface_template_list"
+        )
+
+        on_page_calls = []
+
+        def on_page_callback(count):
+            on_page_calls.append(count)
+
+        client = self._make_client()
+        result = client.get_component_templates(
+            "interface_templates", manufacturer_slug="cisco", on_page=on_page_callback
+        )
+
+        assert len(result) == 2
+        # Callback should be called for both queries
+        assert len(on_page_calls) >= 2
+
+
+class TestLastUpdatedInQueries:
+    """Verify last_updated is returned by the three type-fetching methods."""
+
+    def _mock_graphql(self, mocker, items):
+        client = NetBoxGraphQLClient("http://nb/", "token")
+        mocker.patch.object(client, "query_all", return_value=items)
+        return client
+
+    def test_get_device_types_includes_last_updated(self, mocker):
+        items = [
+            {
+                "id": "1",
+                "model": "M",
+                "slug": "m",
+                "u_height": 1,
+                "part_number": None,
+                "is_full_depth": True,
+                "subdevice_role": None,
+                "airflow": None,
+                "weight": None,
+                "weight_unit": None,
+                "description": "",
+                "comments": "",
+                "front_image": None,
+                "rear_image": None,
+                "last_updated": "2024-01-15T10:00:00Z",
+                "manufacturer": {"id": "1", "name": "Acme", "slug": "acme"},
+            }
+        ]
+        client = self._mock_graphql(mocker, items)
+        by_model, by_slug = client.get_device_types()
+        record = by_model[("acme", "M")]
+        assert record.last_updated == "2024-01-15T10:00:00Z"
+
+    def test_get_module_types_includes_last_updated(self, mocker):
+        items = [
+            {
+                "id": "2",
+                "model": "MM",
+                "part_number": None,
+                "airflow": None,
+                "description": "",
+                "comments": "",
+                "weight": None,
+                "weight_unit": None,
+                "last_updated": "2024-02-01T00:00:00Z",
+                "manufacturer": {"id": "1", "name": "Acme", "slug": "acme"},
+            }
+        ]
+        client = self._mock_graphql(mocker, items)
+        result = client.get_module_types()
+        assert result["acme"]["MM"].last_updated == "2024-02-01T00:00:00Z"
+
+    def test_get_rack_types_includes_last_updated(self, mocker):
+        items = [
+            {
+                "id": "3",
+                "model": "RR",
+                "slug": "acme-rr",
+                "form_factor": "4-post-cabinet",
+                "width": 19,
+                "u_height": 42,
+                "starting_unit": 1,
+                "outer_width": None,
+                "outer_height": None,
+                "outer_depth": None,
+                "outer_unit": None,
+                "mounting_depth": None,
+                "weight": None,
+                "max_weight": None,
+                "weight_unit": None,
+                "desc_units": False,
+                "comments": "",
+                "description": "",
+                "last_updated": "2024-03-10T12:00:00Z",
+                "manufacturer": {"id": "1", "name": "Acme", "slug": "acme"},
+            }
+        ]
+        client = self._mock_graphql(mocker, items)
+        result = client.get_rack_types()
+        assert result["acme"]["RR"].last_updated == "2024-03-10T12:00:00Z"
+
+
+class TestErrorHierarchy:
+    """GraphQL exception classes must form the correct inheritance tree."""
+
+    def test_count_mismatch_error_is_graphql_error(self):
+        from core.graphql_client import GraphQLCountMismatchError, GraphQLError
+
+        assert issubclass(GraphQLCountMismatchError, GraphQLError)
+
+    def test_count_mismatch_error_is_caught_by_graphql_error_handler(self):
+        from core.graphql_client import GraphQLCountMismatchError, GraphQLError
+
+        with pytest.raises(GraphQLError):
+            raise GraphQLCountMismatchError("page cap exceeded")
